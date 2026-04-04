@@ -1,0 +1,21 @@
+{$DOMAIN} {
+  encode gzip zstd
+
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "DENY"
+    Referrer-Policy "strict-origin-when-cross-origin"
+  }
+
+  @health path /health
+  handle @health {
+    reverse_proxy zai-coding-plan-openai-proxy:8787
+  }
+
+  handle {
+    reverse_proxy zai-coding-plan-openai-proxy:8787
+  }
+
+  tls {$ACME_EMAIL}
+}

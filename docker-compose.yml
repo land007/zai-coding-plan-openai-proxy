@@ -1,0 +1,57 @@
+services:
+  zai-coding-plan-openai-proxy:
+    container_name: zai-coding-plan-openai-proxy
+    image: land007/zai-coding-plan-openai-proxy:latest
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      ZAI_API_KEY: ${ZAI_API_KEY}
+      PROXY_API_KEY: ${PROXY_API_KEY:-}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-}
+      ZAI_CODING_PLAN_ENDPOINT: ${ZAI_CODING_PLAN_ENDPOINT:-global}
+      ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-false}
+      FREE_LOGIN_TOTAL_TOKENS: ${FREE_LOGIN_TOTAL_TOKENS:-200000}
+    volumes:
+      - ./data:/app/data
+    expose:
+      - "8787"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:8787/health || exit 1",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - proxy-net
+
+  caddy:
+    container_name: zai-coding-plan-openai-caddy
+    image: caddy:2.10
+    restart: unless-stopped
+    profiles:
+      - prod
+    depends_on:
+      - zai-coding-plan-openai-proxy
+    env_file:
+      - .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile.prod:/etc/caddy/Caddyfile:ro
+      - ./caddy_data:/data
+      - ./caddy_config:/config
+    networks:
+      - proxy-net
+
+networks:
+  proxy-net:
+    driver: bridge
