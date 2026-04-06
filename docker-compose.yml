@@ -16,7 +16,7 @@ services:
       ALLOW_ANONYMOUS: ${ALLOW_ANONYMOUS:-false}
       FREE_LOGIN_TOTAL_TOKENS: ${FREE_LOGIN_TOTAL_TOKENS:-200000}
     volumes:
-      - ./data:/app/data
+      - ./zai-coding-plan-openai-proxy_data:/app/data
     expose:
       - "8787"
     healthcheck:

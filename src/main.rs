@@ -287,6 +287,43 @@ fn handle_client(mut stream: TcpStream, cfg: Arc<AppConfig>) -> io::Result<()> {
         }
     };
 
+    let path_only = request
+        .path
+        .split('?')
+        .next()
+        .unwrap_or(request.path.as_str());
+
+    if matches!(
+        (request.method.as_str(), path_only),
+        ("GET", "/health")
+            | ("OPTIONS", _)
+            | ("GET", "/internal/user-usage")
+            | ("POST", "/internal/grant-tokens")
+    ) {
+        let route_result: io::Result<()> = match (request.method.as_str(), path_only) {
+            ("GET", "/health") => write_json_response(
+                &mut stream,
+                200,
+                "{\"ok\":true,\"provider\":\"zai-coding-plan-openai-proxy\"}",
+            ),
+            ("GET", "/internal/user-usage") => handle_internal_user_usage(&mut stream, &cfg, &request),
+            ("POST", "/internal/grant-tokens") => handle_internal_grant_tokens(&mut stream, &cfg, &request),
+            ("OPTIONS", _) => write_empty_response(&mut stream, 204),
+            _ => Ok(()),
+        };
+
+        if let Err(err) = route_result {
+            eprintln!("request handling error from {peer}: {err}");
+            let _ = write_json_response(
+                &mut stream,
+                502,
+                &json_error("upstream_error", &format!("proxy request failed: {err}")),
+            );
+        }
+
+        return Ok(());
+    }
+
     let auth = match authorize(&request, &cfg) {
         Ok(auth) => auth,
         Err(err) => {
@@ -304,28 +341,15 @@ fn handle_client(mut stream: TcpStream, cfg: Arc<AppConfig>) -> io::Result<()> {
         request.body.len()
     );
 
-    let path_only = request
-        .path
-        .split('?')
-        .next()
-        .unwrap_or(request.path.as_str());
     let route_result: io::Result<()> = match (request.method.as_str(), path_only) {
-        ("GET", "/health") => write_json_response(
-            &mut stream,
-            200,
-            "{\"ok\":true,\"provider\":\"zai-coding-plan-openai-proxy\"}",
-        ),
         ("GET", "/v1/models") => write_json_response(&mut stream, 200, &build_models_payload(&cfg)),
         ("GET", "/v1/usage") => handle_get_usage(&mut stream, &cfg, &auth, &request),
-        ("GET", "/internal/user-usage") => handle_internal_user_usage(&mut stream, &cfg, &request),
-        ("POST", "/internal/grant-tokens") => handle_internal_grant_tokens(&mut stream, &cfg, &request),
         ("GET", path) if path.starts_with("/v1/models/") => {
             handle_get_model(&mut stream, &cfg, path.trim_start_matches("/v1/models/"))
         }
         ("POST", "/v1/chat/completions") => {
             handle_chat_completions(&mut stream, &cfg, &request, &auth)
         }
-        ("OPTIONS", _) => write_empty_response(&mut stream, 204),
         _ => write_json_response(
             &mut stream,
             404,
