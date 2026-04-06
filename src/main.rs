@@ -795,7 +795,7 @@ fn proxy_buffered_response(cfg: &AppConfig, body: &str) -> io::Result<CurlRespon
     let header_path = unique_tmp_path("headers");
     let body_path = unique_tmp_path("body");
 
-    let status = Command::new("curl")
+    let mut child = Command::new("curl")
         .args([
             "-sS",
             "--http1.1",
@@ -813,9 +813,13 @@ fn proxy_buffered_response(cfg: &AppConfig, body: &str) -> io::Result<CurlRespon
             body_path.to_string_lossy().as_ref(),
             &format!("{}/chat/completions", cfg.upstream_base_url),
             "--data-binary",
-            body,
+            "@-",
         ])
-        .status()?;
+        .stdin(Stdio::piped())
+        .spawn()?;
+
+    write_curl_stdin(&mut child, body)?;
+    let status = child.wait()?;
 
     if !status.success() {
         cleanup_tmp(&header_path);
@@ -868,11 +872,14 @@ fn proxy_streaming_response(
             "-",
             &format!("{}/chat/completions", cfg.upstream_base_url),
             "--data-binary",
-            body,
+            "@-",
         ])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+
+    write_curl_stdin(&mut child, body)?;
 
     let mut stdout = BufReader::new(
         child
@@ -920,6 +927,17 @@ fn proxy_streaming_response(
     }
 
     Ok(usage)
+}
+
+fn write_curl_stdin(child: &mut std::process::Child, body: &str) -> io::Result<()> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("missing curl stdin"))?;
+    stdin.write_all(body.as_bytes())?;
+    stdin.flush()?;
+    drop(stdin);
+    Ok(())
 }
 
 fn read_http_headers<R: Read>(reader: &mut R, output: &mut Vec<u8>) -> io::Result<()> {
