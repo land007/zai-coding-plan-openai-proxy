@@ -313,12 +313,8 @@ fn handle_client(mut stream: TcpStream, cfg: Arc<AppConfig>) -> io::Result<()> {
         };
 
         if let Err(err) = route_result {
-            eprintln!("request handling error from {peer}: {err}");
-            let _ = write_json_response(
-                &mut stream,
-                502,
-                &json_error("upstream_error", &format!("proxy request failed: {err}")),
-            );
+            log_route_error(&peer, &err);
+            let _ = write_route_error_response(&mut stream, &err);
         }
 
         return Ok(());
@@ -358,12 +354,8 @@ fn handle_client(mut stream: TcpStream, cfg: Arc<AppConfig>) -> io::Result<()> {
     };
 
     if let Err(err) = route_result {
-        eprintln!("request handling error from {peer}: {err}");
-        let _ = write_json_response(
-            &mut stream,
-            502,
-            &json_error("upstream_error", &format!("proxy request failed: {err}")),
-        );
+        log_route_error(&peer, &err);
+        let _ = write_route_error_response(&mut stream, &err);
     }
 
     Ok(())
@@ -879,6 +871,27 @@ fn proxy_streaming_response(
     cfg: &AppConfig,
     body: &str,
 ) -> io::Result<Option<RequestUsage>> {
+    let mut last_err = None;
+    for attempt in 1..=2 {
+        match proxy_streaming_response_once(stream, cfg, body) {
+            Ok(usage) => return Ok(usage),
+            Err(err) if should_retry_stream_setup(&err) && attempt < 2 => {
+                eprintln!("upstream stream setup failed on attempt {attempt}, retrying once: {err}");
+                last_err = Some(err);
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| io::Error::other("streaming proxy failed without a captured error")))
+}
+
+fn proxy_streaming_response_once(
+    stream: &mut TcpStream,
+    cfg: &AppConfig,
+    body: &str,
+) -> io::Result<Option<RequestUsage>> {
     let mut child = Command::new("curl")
         .args([
             "-sS",
@@ -912,7 +925,16 @@ fn proxy_streaming_response(
             .ok_or_else(|| io::Error::other("missing curl stdout"))?,
     );
     let mut header_bytes = Vec::new();
-    read_http_headers(&mut stdout, &mut header_bytes)?;
+    if let Err(err) = read_http_headers(&mut stdout, &mut header_bytes) {
+        let output = child.wait_with_output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            err.to_string()
+        } else {
+            format!("{}; curl stderr: {}", err, stderr)
+        };
+        return Err(io::Error::new(err.kind(), detail));
+    }
     let header_text = String::from_utf8_lossy(&header_bytes);
     let (status_code, content_type) = parse_header_block(&header_text);
     eprintln!(
@@ -951,6 +973,13 @@ fn proxy_streaming_response(
     }
 
     Ok(usage)
+}
+
+fn should_retry_stream_setup(err: &io::Error) -> bool {
+    let message = err.to_string();
+    err.kind() == io::ErrorKind::UnexpectedEof
+        || message.contains("upstream closed before sending headers")
+        || message.contains("Empty reply from server")
 }
 
 fn write_curl_stdin(child: &mut std::process::Child, body: &str) -> io::Result<()> {
@@ -1070,6 +1099,51 @@ fn write_json_response(stream: &mut TcpStream, status: u16, body: &str) -> io::R
     )?;
     stream.write_all(body.as_bytes())?;
     stream.flush()
+}
+
+fn log_route_error(peer: &str, err: &io::Error) {
+    if is_client_disconnect(err) {
+        eprintln!("request client disconnected from {peer}: {err}");
+        return;
+    }
+    eprintln!("request handling error from {peer}: {err}");
+}
+
+fn write_route_error_response(stream: &mut TcpStream, err: &io::Error) -> io::Result<()> {
+    if is_client_disconnect(err) {
+        return Ok(());
+    }
+
+    let message = err.to_string();
+    let (status, code, client_message) = classify_route_error(err, &message);
+    write_json_response(stream, status, &json_error(code, client_message))
+}
+
+fn classify_route_error(err: &io::Error, message: &str) -> (u16, &'static str, &'static str) {
+    if err.kind() == io::ErrorKind::InvalidData || err.kind() == io::ErrorKind::InvalidInput {
+        return (400, "invalid_request", "request body is invalid");
+    }
+    if message.contains("status=429") {
+        return (429, "rate_limit", "upstream rate limit reached, please retry later");
+    }
+    if message.contains("upstream closed before sending headers") {
+        return (
+            503,
+            "upstream_unavailable",
+            "upstream closed before sending headers, please retry",
+        );
+    }
+    if message.contains("curl upstream request failed") {
+        return (502, "upstream_request_failed", "upstream request failed");
+    }
+    (502, "upstream_error", "proxy request failed")
+}
+
+fn is_client_disconnect(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset | io::ErrorKind::UnexpectedEof
+    ) && !err.to_string().contains("upstream closed before sending headers")
 }
 
 fn write_empty_response(stream: &mut TcpStream, status: u16) -> io::Result<()> {
