@@ -26,6 +26,7 @@ const DEFAULT_USAGE_STORE_PATH: &str = "./data/free-usage.jsonl";
 const DEFAULT_PAID_USAGE_STORE_PATH: &str = "./data/paid-usage.jsonl";
 const DEFAULT_PAID_BALANCE_STORE_PATH: &str = "./data/paid-balances.json";
 const DEFAULT_PAID_GRANT_STORE_PATH: &str = "./data/paid-grants.jsonl";
+const DEFAULT_USER_EMAILS_STORE_PATH: &str = "./data/user-emails.json";
 const AUTH_CALLBACK_PUBLIC_KEY_PEM: &str = include_str!("../auth-callback-public.pem");
 
 #[derive(Clone)]
@@ -42,6 +43,7 @@ struct AppConfig {
     paid_usage_store_path: PathBuf,
     paid_balance_store_path: PathBuf,
     paid_grant_store_path: PathBuf,
+    user_emails_store_path: PathBuf,
     internal_api_key: Option<String>,
 }
 
@@ -115,6 +117,7 @@ enum UsageMode {
 enum AuthContext {
     Anonymous,
     ProxyKey,
+    ApiToken(u64),
     Login(LoginTokenClaims),
 }
 
@@ -222,6 +225,11 @@ fn load_config() -> io::Result<AppConfig> {
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_PAID_GRANT_STORE_PATH));
+    let user_emails_store_path = env::var("USER_EMAILS_STORE_PATH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_USER_EMAILS_STORE_PATH));
     let internal_api_key = env::var("INTERNAL_API_KEY")
         .ok()
         .map(|v| v.trim().to_string())
@@ -240,6 +248,7 @@ fn load_config() -> io::Result<AppConfig> {
         paid_usage_store_path,
         paid_balance_store_path,
         paid_grant_store_path,
+        user_emails_store_path,
         internal_api_key,
     })
 }
@@ -299,6 +308,7 @@ fn handle_client(mut stream: TcpStream, cfg: Arc<AppConfig>) -> io::Result<()> {
             | ("OPTIONS", _)
             | ("GET", "/internal/user-usage")
             | ("POST", "/internal/grant-tokens")
+            | ("POST", "/internal/sync-user")
     ) {
         let route_result: io::Result<()> = match (request.method.as_str(), path_only) {
             ("GET", "/health") => write_json_response(
@@ -308,6 +318,7 @@ fn handle_client(mut stream: TcpStream, cfg: Arc<AppConfig>) -> io::Result<()> {
             ),
             ("GET", "/internal/user-usage") => handle_internal_user_usage(&mut stream, &cfg, &request),
             ("POST", "/internal/grant-tokens") => handle_internal_grant_tokens(&mut stream, &cfg, &request),
+            ("POST", "/internal/sync-user") => handle_internal_sync_user(&mut stream, &cfg, &request),
             ("OPTIONS", _) => write_empty_response(&mut stream, 204),
             _ => Ok(()),
         };
@@ -463,6 +474,42 @@ fn handle_internal_grant_tokens(
     write_json_response(stream, 200, &response.to_string())
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct SyncUserRequest {
+    user_id: u64,
+    email: String,
+}
+
+fn handle_internal_sync_user(
+    stream: &mut TcpStream,
+    cfg: &AppConfig,
+    request: &HttpRequest,
+) -> io::Result<()> {
+    if let Err(err) = authorize_internal(request, cfg) {
+        let status = if err.kind() == io::ErrorKind::PermissionDenied { 403 } else { 500 };
+        return write_json_response(stream, status, &json_error("internal_auth_failed", &err.to_string()));
+    }
+    let body = String::from_utf8(request.body.clone())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "request body must be utf-8 json"))?;
+    let payload = serde_json::from_str::<SyncUserRequest>(&body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid json body: {e}")))?;
+    if payload.user_id == 0 {
+        return write_json_response(stream, 400, &json_error("invalid_user_id", "user_id must be greater than 0"));
+    }
+    if payload.email.trim().is_empty() {
+        return write_json_response(stream, 400, &json_error("invalid_email", "email is required"));
+    }
+
+    sync_user_email(&cfg.user_emails_store_path, payload.user_id, &payload.email.trim())?;
+
+    let response = serde_json::json!({
+        "ok": true,
+        "user_id": payload.user_id,
+        "email": payload.email.trim(),
+    });
+    write_json_response(stream, 200, &response.to_string())
+}
+
 fn read_request(stream: &TcpStream) -> io::Result<HttpRequest> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
@@ -521,12 +568,18 @@ fn read_request(stream: &TcpStream) -> io::Result<HttpRequest> {
 }
 
 fn authorize(request: &HttpRequest, cfg: &AppConfig) -> Result<AuthContext, String> {
-    if let Some(expected) = cfg.proxy_api_key.as_ref() {
-        if let Some(header) = request.headers.get("authorization") {
-            if let Some(token) = header
-                .strip_prefix("Bearer ")
-                .or_else(|| header.strip_prefix("bearer "))
-            {
+    if let Some(header) = request.headers.get("authorization") {
+        if let Some(token) = header
+            .strip_prefix("Bearer ")
+            .or_else(|| header.strip_prefix("bearer "))
+        {
+            // 检查是否是 WebClaw API Key
+            if let Some(user_id) = extract_user_id_from_api_key(token.trim()) {
+                return Ok(AuthContext::ApiToken(user_id));
+            }
+
+            // 检查 PROXY_API_KEY
+            if let Some(expected) = cfg.proxy_api_key.as_ref() {
                 if token.trim() == expected {
                     return Ok(AuthContext::ProxyKey);
                 }
@@ -543,13 +596,30 @@ fn authorize(request: &HttpRequest, cfg: &AppConfig) -> Result<AuthContext, Stri
         return Ok(AuthContext::Anonymous);
     }
 
-    Err("missing proxy api key or valid login token".to_string())
+    Err("missing api key, proxy key, or valid login token".to_string())
+}
+
+fn extract_user_id_from_api_key(key: &str) -> Option<u64> {
+    let key = key.trim();
+    if !key.starts_with("sk-webclaw-") {
+        return None;
+    }
+
+    // 解析：sk-webclaw-{userId}-{xxx}
+    let parts: Vec<&str> = key.split('-').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+
+    // 提取 userId（第3部分）
+    parts.get(2)?.parse::<u64>().ok()
 }
 
 fn auth_label(auth: &AuthContext) -> &'static str {
     match auth {
         AuthContext::Anonymous => "anonymous",
         AuthContext::ProxyKey => "proxy-key",
+        AuthContext::ApiToken(_) => "api-token",
         AuthContext::Login(_) => "login-token",
     }
 }
@@ -694,6 +764,64 @@ fn handle_get_usage(
                 }
             })
         }
+        AuthContext::ApiToken(user_id) => {
+            let email = get_user_email(&cfg.user_emails_store_path, *user_id)?;
+            let free_used_tokens = load_user_consumed_tokens(&cfg.usage_store_path, *user_id)?;
+            let (free_last_24h_tokens, free_last_24h_requests) =
+                load_user_consumed_tokens_last_24h(&cfg.usage_store_path, *user_id)?;
+            let free_remaining_tokens = Some(cfg.free_login_total_tokens.saturating_sub(free_used_tokens));
+            let paid_tokens_purchased = load_user_purchased_tokens(&cfg.paid_balance_store_path, *user_id)?;
+            let paid_tokens_used = load_user_consumed_tokens(&cfg.paid_usage_store_path, *user_id)?;
+            let (paid_last_24h_tokens, paid_last_24h_requests) =
+                load_user_consumed_tokens_last_24h(&cfg.paid_usage_store_path, *user_id)?;
+            let paid_tokens_remaining = Some(paid_tokens_purchased.saturating_sub(paid_tokens_used));
+            let current_source = match requested_mode {
+                UsageMode::PaidBalance => "paid_balance",
+                UsageMode::FreeTrial => "free_trial",
+            };
+            let remaining_tokens = match requested_mode {
+                UsageMode::PaidBalance => paid_tokens_remaining,
+                UsageMode::FreeTrial => free_remaining_tokens,
+            };
+            let last_24h_tokens = match requested_mode {
+                UsageMode::PaidBalance => paid_last_24h_tokens,
+                UsageMode::FreeTrial => free_last_24h_tokens,
+            };
+            let last_24h_requests = match requested_mode {
+                UsageMode::PaidBalance => paid_last_24h_requests,
+                UsageMode::FreeTrial => free_last_24h_requests,
+            };
+            serde_json::json!({
+                "auth_mode": "api_token",
+                "user_id": user_id,
+                "email": email,
+                "is_paid": paid_tokens_purchased > 0,
+                "is_unlimited": false,
+                "usage_mode_requested": usage_mode_label(requested_mode),
+                "current_source": current_source,
+                "free_login_total_tokens": cfg.free_login_total_tokens,
+                "free_tokens_used": free_used_tokens,
+                "free_tokens_remaining": free_remaining_tokens,
+                "free_last_24h_tokens": free_last_24h_tokens,
+                "free_last_24h_requests": free_last_24h_requests,
+                "paid_tokens_purchased": paid_tokens_purchased,
+                "paid_tokens_used": paid_tokens_used,
+                "paid_tokens_remaining": paid_tokens_remaining,
+                "paid_last_24h_tokens": paid_last_24h_tokens,
+                "paid_last_24h_requests": paid_last_24h_requests,
+                "used_tokens": match requested_mode {
+                    UsageMode::PaidBalance => paid_tokens_used,
+                    UsageMode::FreeTrial => free_used_tokens,
+                },
+                "remaining_tokens": remaining_tokens,
+                "last_24h_tokens": last_24h_tokens,
+                "last_24h_requests": last_24h_requests,
+                "message": match requested_mode {
+                    UsageMode::PaidBalance => "paid balance mode uses purchased tokens",
+                    UsageMode::FreeTrial => "free trial mode uses gifted tokens",
+                }
+            })
+        }
     };
     write_json_response(stream, 200, &payload.to_string())
 }
@@ -747,25 +875,28 @@ fn handle_chat_completions(
 }
 
 fn check_login_quota(cfg: &AppConfig, auth: &AuthContext, usage_mode: UsageMode) -> io::Result<Option<String>> {
-    let AuthContext::Login(claims) = auth else {
-        return Ok(None);
+    let user_id = match auth {
+        AuthContext::Login(claims) => claims.user_id,
+        AuthContext::ApiToken(user_id) => *user_id,
+        _ => return Ok(None),
     };
+
     match usage_mode {
         UsageMode::FreeTrial => {
-            let used = load_user_consumed_tokens(&cfg.usage_store_path, claims.user_id)?;
+            let used = load_user_consumed_tokens(&cfg.usage_store_path, user_id)?;
             if used < cfg.free_login_total_tokens {
                 return Ok(None);
             }
             let body = format!(
-                "{{\"error\":{{\"message\":\"free login quota exhausted. used {} of {} tokens\",\"type\":\"insufficient_quota\",\"code\":\"free_quota_exhausted\"}}}}",
+                "{{\"error\":{{\"message\":\"free quota exhausted. used {} of {} tokens\",\"type\":\"insufficient_quota\",\"code\":\"free_quota_exhausted\"}}}}",
                 used,
                 cfg.free_login_total_tokens
             );
             Ok(Some(body))
         }
         UsageMode::PaidBalance => {
-            let purchased = load_user_purchased_tokens(&cfg.paid_balance_store_path, claims.user_id)?;
-            let used = load_user_consumed_tokens(&cfg.paid_usage_store_path, claims.user_id)?;
+            let purchased = load_user_purchased_tokens(&cfg.paid_balance_store_path, user_id)?;
+            let used = load_user_consumed_tokens(&cfg.paid_usage_store_path, user_id)?;
             if used < purchased {
                 return Ok(None);
             }
@@ -787,13 +918,23 @@ fn persist_usage_if_needed(
     stream: bool,
     usage_mode: UsageMode,
 ) -> io::Result<()> {
-    let (AuthContext::Login(claims), Some(usage)) = (auth, usage) else {
+    let (user_id, email) = match auth {
+        AuthContext::Login(claims) => (claims.user_id, claims.email.clone()),
+        AuthContext::ApiToken(user_id) => {
+            let email = get_user_email(&cfg.user_emails_store_path, *user_id)?;
+            (*user_id, email)
+        }
+        _ => return Ok(()),
+    };
+
+    let Some(usage) = usage else {
         return Ok(());
     };
+
     let record = UsageRecord {
         ts: now_ms(),
-        user_id: claims.user_id,
-        email: claims.email.clone(),
+        user_id,
+        email,
         total_tokens: usage.total_tokens,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
@@ -1485,6 +1626,41 @@ fn find_grant_record_by_order_no(path: &Path, order_no: &str) -> io::Result<Opti
         }
     }
     Ok(None)
+}
+
+fn sync_user_email(path: &Path, user_id: u64, email: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _guard = FileLockGuard::acquire(path)?;
+    let mut emails = if path.exists() {
+        serde_json::from_str::<Value>(&fs::read_to_string(path)?)
+            .unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    let user_key = user_id.to_string();
+    emails[&user_key] = Value::from(email.trim());
+    let bytes = serde_json::to_vec_pretty(&emails)
+        .map_err(|e| io::Error::other(format!("serialize user emails failed: {e}")))?;
+    atomic_write_bytes(path, &bytes)?;
+    Ok(())
+}
+
+fn get_user_email(path: &Path, user_id: u64) -> io::Result<String> {
+    if !path.exists() {
+        return Ok(format!("user-{}@example.com", user_id));
+    }
+    let _guard = FileLockGuard::acquire(path)?;
+    let content = fs::read_to_string(path)?;
+    let value = serde_json::from_str::<Value>(&content)
+        .map_err(|e| io::Error::other(format!("parse user emails failed: {e}")))?;
+    let user_key = user_id.to_string();
+    Ok(value
+        .get(&user_key)
+        .and_then(Value::as_str)
+        .unwrap_or(&format!("user-{}@example.com", user_key))
+        .to_string())
 }
 
 fn request_query_param(path: &str, key: &str) -> Option<String> {
