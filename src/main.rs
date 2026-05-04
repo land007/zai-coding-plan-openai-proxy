@@ -256,6 +256,26 @@ fn load_config() -> io::Result<AppConfig> {
 fn allowed_models() -> Vec<ModelAlias> {
     vec![
         ModelAlias {
+            public_id: "zai/glm-4.7",
+            upstream_id: "glm-4.7",
+        },
+        ModelAlias {
+            public_id: "zai/glm-4.7-flash",
+            upstream_id: "glm-4.7-flash",
+        },
+        ModelAlias {
+            public_id: "zai/glm-4.7-flashx",
+            upstream_id: "glm-4.7-flashx",
+        },
+        ModelAlias {
+            public_id: "zai/glm-5",
+            upstream_id: "glm-5",
+        },
+        ModelAlias {
+            public_id: "zai/glm-5-turbo",
+            upstream_id: "glm-5-turbo",
+        },
+        ModelAlias {
             public_id: "zai-coding-plan/glm-5",
             upstream_id: "glm-5",
         },
@@ -356,6 +376,9 @@ fn handle_client(mut stream: TcpStream, cfg: Arc<AppConfig>) -> io::Result<()> {
         }
         ("POST", "/v1/chat/completions") => {
             handle_chat_completions(&mut stream, &cfg, &request, &auth)
+        }
+        ("POST", "/api/anthropic/v1/messages") => {
+            handle_anthropic_messages(&mut stream, &cfg, &request, &auth)
         }
         _ => write_json_response(
             &mut stream,
@@ -673,7 +696,7 @@ fn handle_get_usage(
     auth: &AuthContext,
     request: &HttpRequest,
 ) -> io::Result<()> {
-    let requested_mode = requested_usage_mode_from_headers(&request.headers);
+    let requested_mode = requested_usage_mode_from_headers(&request.headers).unwrap_or(UsageMode::FreeTrial);
     let payload = match auth {
         AuthContext::ProxyKey => serde_json::json!({
             "auth_mode": "proxy_key",
@@ -832,7 +855,10 @@ fn handle_chat_completions(
     request: &HttpRequest,
     auth: &AuthContext,
 ) -> io::Result<()> {
-    let usage_mode = requested_usage_mode_from_headers(&request.headers);
+    let usage_mode = match requested_usage_mode_from_headers(&request.headers) {
+        Some(mode) => mode,
+        None => auto_resolve_usage_mode(cfg, auth)?,
+    };
     if let Some(error_body) = check_login_quota(cfg, auth, usage_mode)? {
         return write_json_response(stream, 429, &error_body);
     }
@@ -872,6 +898,624 @@ fn handle_chat_completions(
         persist_usage_if_needed(cfg, auth, response.usage.clone(), &model, false, usage_mode)?;
         write_upstream_response(stream, response)
     }
+}
+
+// Anthropic Messages API entrypoint. Translates inbound Anthropic JSON to
+// OpenAI chat-completions, calls the upstream non-streaming, and emits an
+// Anthropic-shaped response (or a synthesized SSE stream when requested).
+// Pure conversion helpers below are ported from
+// webclaw-launcher-tauri/src-tauri/src/services/launcher_claude_service.rs.
+fn handle_anthropic_messages(
+    stream: &mut TcpStream,
+    cfg: &AppConfig,
+    request: &HttpRequest,
+    auth: &AuthContext,
+) -> io::Result<()> {
+    let usage_mode = match requested_usage_mode_from_headers(&request.headers) {
+        Some(mode) => mode,
+        None => auto_resolve_usage_mode(cfg, auth)?,
+    };
+    if let Some(error_body) = check_login_quota(cfg, auth, usage_mode)? {
+        let message = serde_json::from_str::<Value>(&error_body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or(error_body);
+        return write_anthropic_error(stream, 429, "rate_limit_error", &message);
+    }
+
+    let body_text = String::from_utf8(request.body.clone()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "request body must be utf-8 json")
+    })?;
+    let mut anthropic_payload: Value = serde_json::from_str(&body_text).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("invalid anthropic json: {e}"))
+    })?;
+
+    let requested_model = anthropic_payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let client_wants_stream = anthropic_payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    let Some(mapped) = cfg
+        .allowed_models
+        .iter()
+        .find(|entry| entry.public_id == requested_model)
+    else {
+        eprintln!("blocked unsupported anthropic model: {requested_model}");
+        return write_anthropic_error(
+            stream,
+            400,
+            "invalid_request_error",
+            &format!("unsupported model: {}", requested_model),
+        );
+    };
+
+    let openai_payload =
+        match convert_anthropic_request_to_openai(&mut anthropic_payload, mapped.upstream_id) {
+            Ok(value) => value,
+            Err(msg) => {
+                return write_anthropic_error(stream, 400, "invalid_request_error", &msg);
+            }
+        };
+    let openai_body = openai_payload.to_string();
+
+    eprintln!(
+        "anthropic messages model={} mapped_model={} stream={}",
+        requested_model, mapped.upstream_id, client_wants_stream
+    );
+
+    let response = proxy_buffered_response(cfg, &openai_body)?;
+    persist_usage_if_needed(
+        cfg,
+        auth,
+        response.usage.clone(),
+        &requested_model,
+        client_wants_stream,
+        usage_mode,
+    )?;
+
+    if response.status_code >= 400 {
+        eprintln!(
+            "anthropic upstream error status={} body-bytes={}",
+            response.status_code,
+            response.body.len()
+        );
+        let message = serde_json::from_slice::<Value>(&response.body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| String::from_utf8_lossy(&response.body).into_owned());
+        return write_anthropic_error(stream, response.status_code, "api_error", &message);
+    }
+
+    let openai_response: Value = serde_json::from_slice(&response.body).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid upstream chat response json: {e}"),
+        )
+    })?;
+    let anthropic_response =
+        convert_openai_response_to_anthropic(&openai_response, &requested_model);
+
+    if client_wants_stream {
+        let sse_body = synthesize_anthropic_sse(&anthropic_response);
+        write_anthropic_sse(stream, &sse_body)
+    } else {
+        write_json_response(stream, 200, &anthropic_response.to_string())
+    }
+}
+
+fn write_anthropic_error(
+    stream: &mut TcpStream,
+    status: u16,
+    error_type: &str,
+    message: &str,
+) -> io::Result<()> {
+    let body = format!(
+        "{{\"type\":\"error\",\"error\":{{\"type\":\"{}\",\"message\":\"{}\"}}}}",
+        error_type,
+        escape_json(message),
+    );
+    write_json_response(stream, status, &body)
+}
+
+fn write_anthropic_sse(stream: &mut TcpStream, body: &str) -> io::Result<()> {
+    write_status_line(stream, 200)?;
+    write_common_headers(
+        stream,
+        Some("text/event-stream; charset=utf-8".to_string()),
+        Some(body.len()),
+    )?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()
+}
+
+fn anthropic_unique_id(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}_{:x}{:x}", prefix, now_ms(), counter)
+}
+
+fn convert_anthropic_request_to_openai(
+    payload: &mut Value,
+    upstream_model: &str,
+) -> Result<Value, String> {
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| "anthropic payload must be an object".to_string())?;
+
+    let mut messages = Vec::<Value>::new();
+    let system_text = extract_anthropic_system_text(object.remove("system"));
+    if !system_text.trim().is_empty() {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": system_text,
+        }));
+    }
+
+    for message in object
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        convert_anthropic_message(role, message.get("content"), &mut messages);
+    }
+
+    let mut openai = serde_json::Map::new();
+    openai.insert(
+        "model".to_string(),
+        Value::String(upstream_model.to_string()),
+    );
+    openai.insert("messages".to_string(), Value::Array(messages));
+    openai.insert("stream".to_string(), Value::Bool(false));
+
+    if let Some(max_tokens) = object.get("max_tokens").and_then(Value::as_u64) {
+        openai.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+    }
+    if let Some(temperature) = object.get("temperature").and_then(Value::as_f64) {
+        openai.insert("temperature".to_string(), serde_json::json!(temperature));
+    }
+    if let Some(top_p) = object.get("top_p").and_then(Value::as_f64) {
+        openai.insert("top_p".to_string(), serde_json::json!(top_p));
+    }
+    if let Some(tools) = convert_anthropic_tools(object.get("tools")) {
+        openai.insert("tools".to_string(), tools);
+    }
+    if let Some(tool_choice) = convert_anthropic_tool_choice(object.get("tool_choice")) {
+        openai.insert("tool_choice".to_string(), tool_choice);
+    }
+
+    Ok(Value::Object(openai))
+}
+
+fn convert_anthropic_message(role: &str, content: Option<&Value>, messages: &mut Vec<Value>) {
+    match role {
+        "assistant" => convert_anthropic_assistant_message(content, messages),
+        _ => convert_anthropic_user_message(content, messages),
+    }
+}
+
+fn convert_anthropic_user_message(content: Option<&Value>, messages: &mut Vec<Value>) {
+    if let Some(text) = inline_anthropic_content_to_text(content) {
+        if !text.trim().is_empty() {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": text,
+            }));
+        }
+    }
+
+    for block in content.and_then(Value::as_array).cloned().unwrap_or_default() {
+        if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+            continue;
+        }
+        let tool_use_id = block
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if tool_use_id.is_empty() {
+            continue;
+        }
+        let mut tool_text = block_anthropic_content_to_text(block.get("content"));
+        if block.get("is_error").and_then(Value::as_bool).unwrap_or(false) {
+            tool_text = format!("Tool execution failed.\n{}", tool_text);
+        }
+        messages.push(serde_json::json!({
+            "role": "tool",
+            "tool_call_id": tool_use_id,
+            "content": tool_text,
+        }));
+    }
+}
+
+fn convert_anthropic_assistant_message(content: Option<&Value>, messages: &mut Vec<Value>) {
+    let text = inline_anthropic_content_to_text(content).unwrap_or_default();
+    let mut tool_calls = Vec::<Value>::new();
+    for block in content.and_then(Value::as_array).cloned().unwrap_or_default() {
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        let id = block
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| anthropic_unique_id("toolu"));
+        let name = block
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("tool")
+            .to_string();
+        let input = block
+            .get("input")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        tool_calls.push(serde_json::json!({
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": input.to_string(),
+            }
+        }));
+    }
+
+    let mut message = serde_json::Map::new();
+    message.insert("role".to_string(), Value::String("assistant".to_string()));
+    message.insert("content".to_string(), Value::String(text));
+    if !tool_calls.is_empty() {
+        message.insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    messages.push(Value::Object(message));
+}
+
+fn extract_anthropic_system_text(system: Option<Value>) -> String {
+    match system {
+        Some(Value::String(text)) => text,
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
+fn inline_anthropic_content_to_text(content: Option<&Value>) -> Option<String> {
+    match content {
+        Some(Value::String(text)) => Some(text.to_string()),
+        Some(Value::Array(blocks)) => {
+            let text = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            Some(text)
+        }
+        Some(other) => Some(other.to_string()),
+        None => None,
+    }
+}
+
+fn block_anthropic_content_to_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.to_string(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .map(|block| match block.get("type").and_then(Value::as_str) {
+                Some("text") => block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                _ => block.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
+fn convert_anthropic_tools(value: Option<&Value>) -> Option<Value> {
+    let tools = value?.as_array()?;
+    Some(Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name").and_then(Value::as_str).unwrap_or("tool"),
+                        "description": tool.get("description").and_then(Value::as_str).unwrap_or_default(),
+                        "parameters": tool.get("input_schema").cloned().unwrap_or_else(|| serde_json::json!({
+                            "type": "object",
+                            "properties": {}
+                        })),
+                    }
+                })
+            })
+            .collect(),
+    ))
+}
+
+fn convert_anthropic_tool_choice(value: Option<&Value>) -> Option<Value> {
+    let tool_choice = value?;
+    if let Some(choice_type) = tool_choice.get("type").and_then(Value::as_str) {
+        return match choice_type {
+            "auto" => Some(Value::String("auto".to_string())),
+            "any" => Some(Value::String("required".to_string())),
+            "tool" => tool_choice.get("name").and_then(Value::as_str).map(|name| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                    }
+                })
+            }),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn convert_openai_response_to_anthropic(openai: &Value, requested_model: &str) -> Value {
+    let message = openai
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let finish_reason = openai
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("stop");
+
+    let text = message
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut content = Vec::<Value>::new();
+    if !text.is_empty() {
+        content.push(serde_json::json!({
+            "type": "text",
+            "text": text,
+        }));
+    }
+    for tool_call in message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let input = tool_call
+            .get("function")
+            .and_then(|function| function.get("arguments"))
+            .and_then(Value::as_str)
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        content.push(serde_json::json!({
+            "type": "tool_use",
+            "id": tool_call.get("id").and_then(Value::as_str).unwrap_or_default(),
+            "name": tool_call
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("tool"),
+            "input": input,
+        }));
+    }
+
+    serde_json::json!({
+        "id": openai
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| anthropic_unique_id("msg")),
+        "type": "message",
+        "role": "assistant",
+        "model": if requested_model.trim().is_empty() { "glm" } else { requested_model },
+        "content": content,
+        "stop_reason": map_anthropic_stop_reason(finish_reason),
+        "stop_sequence": Value::Null,
+        "usage": {
+            "input_tokens": openai
+                .get("usage")
+                .and_then(|usage| usage.get("prompt_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            "output_tokens": openai
+                .get("usage")
+                .and_then(|usage| usage.get("completion_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        }
+    })
+}
+
+fn map_anthropic_stop_reason(finish_reason: &str) -> &'static str {
+    match finish_reason {
+        "tool_calls" => "tool_use",
+        "length" => "max_tokens",
+        _ => "end_turn",
+    }
+}
+
+fn synthesize_anthropic_sse(message: &Value) -> String {
+    let mut body = String::new();
+    let input_tokens = message
+        .get("usage")
+        .and_then(|usage| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = message
+        .get("usage")
+        .and_then(|usage| usage.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let empty_message = serde_json::json!({
+        "id": message.get("id").cloned().unwrap_or_else(|| Value::String(anthropic_unique_id("msg"))),
+        "type": "message",
+        "role": "assistant",
+        "model": message.get("model").cloned().unwrap_or_else(|| serde_json::json!("glm")),
+        "content": [],
+        "stop_reason": Value::Null,
+        "stop_sequence": Value::Null,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": 0,
+        }
+    });
+    push_anthropic_sse_event(
+        &mut body,
+        "message_start",
+        &serde_json::json!({
+            "type": "message_start",
+            "message": empty_message,
+        }),
+    );
+
+    for (index, block) in message
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        match block.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "tool_use" => {
+                push_anthropic_sse_event(
+                    &mut body,
+                    "content_block_start",
+                    &serde_json::json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": block.get("id").cloned().unwrap_or_else(|| Value::String(anthropic_unique_id("toolu"))),
+                            "name": block.get("name").cloned().unwrap_or_else(|| serde_json::json!("tool")),
+                            "input": {},
+                        }
+                    }),
+                );
+                push_anthropic_sse_event(
+                    &mut body,
+                    "content_block_delta",
+                    &serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": block.get("input").cloned().unwrap_or_else(|| serde_json::json!({})).to_string(),
+                        }
+                    }),
+                );
+                push_anthropic_sse_event(
+                    &mut body,
+                    "content_block_stop",
+                    &serde_json::json!({
+                        "type": "content_block_stop",
+                        "index": index,
+                    }),
+                );
+            }
+            _ => {
+                push_anthropic_sse_event(
+                    &mut body,
+                    "content_block_start",
+                    &serde_json::json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "text",
+                            "text": "",
+                        }
+                    }),
+                );
+                push_anthropic_sse_event(
+                    &mut body,
+                    "content_block_delta",
+                    &serde_json::json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "text_delta",
+                            "text": block.get("text").and_then(Value::as_str).unwrap_or_default(),
+                        }
+                    }),
+                );
+                push_anthropic_sse_event(
+                    &mut body,
+                    "content_block_stop",
+                    &serde_json::json!({
+                        "type": "content_block_stop",
+                        "index": index,
+                    }),
+                );
+            }
+        }
+    }
+
+    push_anthropic_sse_event(
+        &mut body,
+        "message_delta",
+        &serde_json::json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": message.get("stop_reason").cloned().unwrap_or(Value::Null),
+                "stop_sequence": Value::Null,
+            },
+            "usage": {
+                "output_tokens": output_tokens,
+            }
+        }),
+    );
+    push_anthropic_sse_event(
+        &mut body,
+        "message_stop",
+        &serde_json::json!({
+            "type": "message_stop",
+        }),
+    );
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+fn push_anthropic_sse_event(body: &mut String, event: &str, payload: &Value) {
+    body.push_str("event: ");
+    body.push_str(event);
+    body.push('\n');
+    body.push_str("data: ");
+    body.push_str(&payload.to_string());
+    body.push_str("\n\n");
 }
 
 fn check_login_quota(cfg: &AppConfig, auth: &AuthContext, usage_mode: UsageMode) -> io::Result<Option<String>> {
@@ -1505,10 +2149,26 @@ fn verify_login_token(token: &str) -> Result<LoginTokenClaims, String> {
     Ok(claims)
 }
 
-fn requested_usage_mode_from_headers(headers: &HashMap<String, String>) -> UsageMode {
+fn requested_usage_mode_from_headers(headers: &HashMap<String, String>) -> Option<UsageMode> {
     match headers.get(USAGE_MODE_HEADER).map(|value| value.trim()) {
-        Some("paid_balance") => UsageMode::PaidBalance,
-        _ => UsageMode::FreeTrial,
+        Some("paid_balance") => Some(UsageMode::PaidBalance),
+        Some("free_trial") => Some(UsageMode::FreeTrial),
+        _ => None,
+    }
+}
+
+fn auto_resolve_usage_mode(cfg: &AppConfig, auth: &AuthContext) -> io::Result<UsageMode> {
+    let user_id = match auth {
+        AuthContext::Login(claims) => claims.user_id,
+        AuthContext::ApiToken(user_id) => *user_id,
+        _ => return Ok(UsageMode::FreeTrial),
+    };
+    let purchased = load_user_purchased_tokens(&cfg.paid_balance_store_path, user_id)?;
+    let used = load_user_consumed_tokens(&cfg.paid_usage_store_path, user_id)?;
+    if purchased > used {
+        Ok(UsageMode::PaidBalance)
+    } else {
+        Ok(UsageMode::FreeTrial)
     }
 }
 
