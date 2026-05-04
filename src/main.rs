@@ -255,6 +255,24 @@ fn load_config() -> io::Result<AppConfig> {
 
 fn allowed_models() -> Vec<ModelAlias> {
     vec![
+        // bare ids — what the new launcher (provider key "webclaw") sends
+        ModelAlias {
+            public_id: "glm-4.7",
+            upstream_id: "glm-4.7",
+        },
+        ModelAlias {
+            public_id: "glm-4.7-flash",
+            upstream_id: "glm-4.7-flash",
+        },
+        ModelAlias {
+            public_id: "glm-5",
+            upstream_id: "glm-5",
+        },
+        ModelAlias {
+            public_id: "glm-5-turbo",
+            upstream_id: "glm-5-turbo",
+        },
+        // legacy ids — kept so already-deployed instances keep working
         ModelAlias {
             public_id: "zai/glm-4.7",
             upstream_id: "glm-4.7",
@@ -262,10 +280,6 @@ fn allowed_models() -> Vec<ModelAlias> {
         ModelAlias {
             public_id: "zai/glm-4.7-flash",
             upstream_id: "glm-4.7-flash",
-        },
-        ModelAlias {
-            public_id: "zai/glm-4.7-flashx",
-            upstream_id: "glm-4.7-flashx",
         },
         ModelAlias {
             public_id: "zai/glm-5",
@@ -290,10 +304,6 @@ fn allowed_models() -> Vec<ModelAlias> {
         ModelAlias {
             public_id: "zai-coding-plan/glm-4.7-flash",
             upstream_id: "glm-4.7-flash",
-        },
-        ModelAlias {
-            public_id: "zai-coding-plan/glm-4.7-flashx",
-            upstream_id: "glm-4.7-flashx",
         },
     ]
 }
