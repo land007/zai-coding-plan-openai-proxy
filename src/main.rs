@@ -27,6 +27,7 @@ const DEFAULT_PAID_USAGE_STORE_PATH: &str = "./data/paid-usage.jsonl";
 const DEFAULT_PAID_BALANCE_STORE_PATH: &str = "./data/paid-balances.json";
 const DEFAULT_PAID_GRANT_STORE_PATH: &str = "./data/paid-grants.jsonl";
 const DEFAULT_USER_EMAILS_STORE_PATH: &str = "./data/user-emails.json";
+const DEFAULT_API_KEYS_STORE_PATH: &str = "./data/api-keys.json";
 const AUTH_CALLBACK_PUBLIC_KEY_PEM: &str = include_str!("../auth-callback-public.pem");
 
 #[derive(Clone)]
@@ -44,6 +45,7 @@ struct AppConfig {
     paid_balance_store_path: PathBuf,
     paid_grant_store_path: PathBuf,
     user_emails_store_path: PathBuf,
+    api_keys_store_path: PathBuf,
     internal_api_key: Option<String>,
 }
 
@@ -89,6 +91,21 @@ struct PaidGrantRecord {
     product_type: String,
     granted_tokens: u64,
     balance_after: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApiKeyRecord {
+    key: String,
+    user_id: u64,
+    email: String,
+    created_at: u64,
+    is_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApiKeyStorage {
+    keys: HashMap<String, ApiKeyRecord>,
+    user_keys: HashMap<u64, Vec<String>>, // user_id -> keys (最新的在前)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -230,6 +247,11 @@ fn load_config() -> io::Result<AppConfig> {
         .filter(|v| !v.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_USER_EMAILS_STORE_PATH));
+    let api_keys_store_path = env::var("API_KEYS_STORE_PATH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_API_KEYS_STORE_PATH));
     let internal_api_key = env::var("INTERNAL_API_KEY")
         .ok()
         .map(|v| v.trim().to_string())
@@ -249,6 +271,7 @@ fn load_config() -> io::Result<AppConfig> {
         paid_balance_store_path,
         paid_grant_store_path,
         user_emails_store_path,
+        api_keys_store_path,
         internal_api_key,
     })
 }
@@ -257,12 +280,8 @@ fn allowed_models() -> Vec<ModelAlias> {
     vec![
         // bare ids — what the new launcher (provider key "webclaw") sends
         ModelAlias {
-            public_id: "glm-4.7",
-            upstream_id: "glm-4.7",
-        },
-        ModelAlias {
-            public_id: "glm-4.7-flash",
-            upstream_id: "glm-4.7-flash",
+            public_id: "glm-5.1",
+            upstream_id: "glm-5.1",
         },
         ModelAlias {
             public_id: "glm-5",
@@ -271,6 +290,14 @@ fn allowed_models() -> Vec<ModelAlias> {
         ModelAlias {
             public_id: "glm-5-turbo",
             upstream_id: "glm-5-turbo",
+        },
+        ModelAlias {
+            public_id: "glm-4.7",
+            upstream_id: "glm-4.7",
+        },
+        ModelAlias {
+            public_id: "glm-4.7-flash",
+            upstream_id: "glm-4.7-flash",
         },
         // legacy ids — kept so already-deployed instances keep working
         ModelAlias {
@@ -339,6 +366,8 @@ fn handle_client(mut stream: TcpStream, cfg: Arc<AppConfig>) -> io::Result<()> {
             | ("GET", "/internal/user-usage")
             | ("POST", "/internal/grant-tokens")
             | ("POST", "/internal/sync-user")
+            | ("POST", "/internal/revoke-api-key")
+            | ("POST", "/internal/add-api-key")
     ) {
         let route_result: io::Result<()> = match (request.method.as_str(), path_only) {
             ("GET", "/health") => write_json_response(
@@ -349,6 +378,8 @@ fn handle_client(mut stream: TcpStream, cfg: Arc<AppConfig>) -> io::Result<()> {
             ("GET", "/internal/user-usage") => handle_internal_user_usage(&mut stream, &cfg, &request),
             ("POST", "/internal/grant-tokens") => handle_internal_grant_tokens(&mut stream, &cfg, &request),
             ("POST", "/internal/sync-user") => handle_internal_sync_user(&mut stream, &cfg, &request),
+            ("POST", "/internal/revoke-api-key") => handle_internal_revoke_api_key(&mut stream, &cfg, &request),
+            ("POST", "/internal/add-api-key") => handle_internal_add_api_key(&mut stream, &cfg, &request),
             ("OPTIONS", _) => write_empty_response(&mut stream, 204),
             _ => Ok(()),
         };
@@ -543,6 +574,90 @@ fn handle_internal_sync_user(
     write_json_response(stream, 200, &response.to_string())
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct RevokeApiKeyRequest {
+    user_id: u64,
+    old_key: Option<String>,
+}
+
+fn handle_internal_revoke_api_key(
+    stream: &mut TcpStream,
+    cfg: &AppConfig,
+    request: &HttpRequest,
+) -> io::Result<()> {
+    if let Err(err) = authorize_internal(request, cfg) {
+        let status = if err.kind() == io::ErrorKind::PermissionDenied { 403 } else { 500 };
+        return write_json_response(stream, status, &json_error("internal_auth_failed", &err.to_string()));
+    }
+    let body = String::from_utf8(request.body.clone())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "request body must be utf-8 json"))?;
+    let payload = serde_json::from_str::<RevokeApiKeyRequest>(&body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid json body: {e}")))?;
+    if payload.user_id == 0 {
+        return write_json_response(stream, 400, &json_error("invalid_user_id", "user_id must be greater than 0"));
+    }
+
+    let revoked_count = revoke_api_key(
+        &cfg.api_keys_store_path,
+        payload.user_id,
+        payload.old_key.as_deref(),
+    )?;
+
+    let active_key = get_active_api_key(&cfg.api_keys_store_path, payload.user_id)?;
+
+    let response = serde_json::json!({
+        "ok": true,
+        "revoked_count": revoked_count,
+        "active_key": active_key,
+    });
+    write_json_response(stream, 200, &response.to_string())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AddApiKeyRequest {
+    user_id: u64,
+    email: String,
+    api_key: String,
+}
+
+fn handle_internal_add_api_key(
+    stream: &mut TcpStream,
+    cfg: &AppConfig,
+    request: &HttpRequest,
+) -> io::Result<()> {
+    if let Err(err) = authorize_internal(request, cfg) {
+        let status = if err.kind() == io::ErrorKind::PermissionDenied { 403 } else { 500 };
+        return write_json_response(stream, status, &json_error("internal_auth_failed", &err.to_string()));
+    }
+    let body = String::from_utf8(request.body.clone())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "request body must be utf-8 json"))?;
+    let payload = serde_json::from_str::<AddApiKeyRequest>(&body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid json body: {e}")))?;
+    if payload.user_id == 0 {
+        return write_json_response(stream, 400, &json_error("invalid_user_id", "user_id must be greater than 0"));
+    }
+    if payload.api_key.trim().is_empty() {
+        return write_json_response(stream, 400, &json_error("invalid_api_key", "api_key is required"));
+    }
+    if payload.email.trim().is_empty() {
+        return write_json_response(stream, 400, &json_error("invalid_email", "email is required"));
+    }
+
+    add_api_key(
+        &cfg.api_keys_store_path,
+        &payload.api_key,
+        payload.user_id,
+        &payload.email,
+    )?;
+
+    let response = serde_json::json!({
+        "ok": true,
+        "user_id": payload.user_id,
+        "api_key": payload.api_key,
+    });
+    write_json_response(stream, 200, &response.to_string())
+}
+
 fn read_request(stream: &TcpStream) -> io::Result<HttpRequest> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
@@ -600,6 +715,99 @@ fn read_request(stream: &TcpStream) -> io::Result<HttpRequest> {
     })
 }
 
+fn load_api_keys(path: &Path) -> io::Result<ApiKeyStorage> {
+    if !path.exists() {
+        return Ok(ApiKeyStorage {
+            keys: HashMap::new(),
+            user_keys: HashMap::new(),
+        });
+    }
+    let _guard = FileLockGuard::acquire(path)?;
+    let content = fs::read_to_string(path)?;
+    serde_json::from_str(&content)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse api keys storage failed: {e}")))
+}
+
+fn save_api_keys(path: &Path, storage: &ApiKeyStorage) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _guard = FileLockGuard::acquire(path)?;
+    let bytes = serde_json::to_vec_pretty(storage)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("serialize api keys storage failed: {e}")))?;
+    atomic_write_bytes(path, &bytes)
+}
+
+fn is_api_key_valid(path: &Path, key: &str) -> bool {
+    let key = key.trim();
+    match load_api_keys(path) {
+        Ok(storage) => storage.keys.get(key).map(|record| record.is_active).unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+fn add_api_key(path: &Path, key: &str, user_id: u64, email: &str) -> io::Result<()> {
+    let mut storage = load_api_keys(path)?;
+    let key = key.trim();
+    let record = ApiKeyRecord {
+        key: key.to_string(),
+        user_id,
+        email: email.trim().to_string(),
+        created_at: now_ms(),
+        is_active: true,
+    };
+
+    // Add to keys HashMap
+    storage.keys.insert(key.to_string(), record.clone());
+
+    // Add to user_keys HashMap (keeping newest first)
+    storage.user_keys
+        .entry(user_id)
+        .or_insert_with(Vec::new)
+        .insert(0, key.to_string());
+
+    save_api_keys(path, &storage)
+}
+
+fn revoke_api_key(path: &Path, user_id: u64, old_key: Option<&str>) -> io::Result<u64> {
+    let mut storage = load_api_keys(path)?;
+    let mut revoked_count = 0u64;
+
+    if let Some(old_key) = old_key {
+        // Revoke specific key
+        let old_key = old_key.trim();
+        if let Some(record) = storage.keys.get_mut(old_key) {
+            if record.user_id == user_id && record.is_active {
+                record.is_active = false;
+                revoked_count = 1;
+            }
+        }
+    } else {
+        // Revoke all keys for user
+        if let Some(keys) = storage.user_keys.get(&user_id) {
+            for key in keys {
+                if let Some(record) = storage.keys.get_mut(key) {
+                    if record.is_active {
+                        record.is_active = false;
+                        revoked_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    save_api_keys(path, &storage)?;
+    Ok(revoked_count)
+}
+
+fn get_active_api_key(path: &Path, user_id: u64) -> io::Result<Option<String>> {
+    let storage = load_api_keys(path)?;
+    Ok(storage.user_keys.get(&user_id)
+        .and_then(|keys| keys.first())
+        .filter(|key| storage.keys.get(*key).map(|r| r.is_active).unwrap_or(false))
+        .map(|k| k.to_string()))
+}
+
 fn authorize(request: &HttpRequest, cfg: &AppConfig) -> Result<AuthContext, String> {
     if let Some(header) = request.headers.get("authorization") {
         if let Some(token) = header
@@ -608,6 +816,10 @@ fn authorize(request: &HttpRequest, cfg: &AppConfig) -> Result<AuthContext, Stri
         {
             // 检查是否是 WebClaw API Key
             if let Some(user_id) = extract_user_id_from_api_key(token.trim()) {
+                // 检查白名单
+                if !is_api_key_valid(&cfg.api_keys_store_path, token.trim()) {
+                    return Err("API key not found or revoked".to_string());
+                }
                 return Ok(AuthContext::ApiToken(user_id));
             }
 
